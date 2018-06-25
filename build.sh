@@ -1,8 +1,8 @@
 #!/bin/bash
 
-if [ $# -ne 4 ]; then
+if [ $# -lt 4 ]; then
     cat - <<EOF
-    Usage: $0 name target buildroot_treeish
+    Usage: $0 name target buildroot_treeish version build_type(optional)
 
 name:
         This is the name of the toolchain you are compiling. The name should at
@@ -19,6 +19,9 @@ buildroot_treeish:
 
 version:
 	Version identifier.
+
+build_type: (optional)
+	local - disables uploading of material to the web server
 EOF
     exit 1
 fi
@@ -27,11 +30,13 @@ echo "Building $1"
 echo "Target: $2"
 echo "Buildroot tree: $3"
 echo "Version identifier: $4"
+echo "Build type: $5"
 
 name="$1"
 target="$2"
 buildroot_tree="$3"
 version="$4"
+build_type="$5"
 
 ssh_server="gitlabci@toolchains.bootlin.com"
 main_dir=$(pwd)
@@ -51,14 +56,23 @@ if [ "$target" == "ci_debug" ]; then
     exit 0;
 fi
 
-git clone https://github.com/buildroot/buildroot.git ${buildroot_dir} || exit 1
-cd ${buildroot_dir}
-git remote add buildroot-toolchains https://github.com/free-electrons/buildroot-toolchains.git || exit 1
-git fetch buildroot-toolchains || exit 1
+if [ ! -d "${buildroot_dir}" ]; then
+	git clone https://github.com/buildroot/buildroot.git ${buildroot_dir} || exit 1
+	cd ${buildroot_dir}
+	git remote add buildroot-toolchains https://github.com/free-electrons/buildroot-toolchains.git || exit 1
+	git fetch buildroot-toolchains || exit 1
+else
+	cd ${buildroot_dir}
+	git fetch --all
+fi
 git checkout $buildroot_tree || exit 1
 br_version=$(git describe --tags)
 echo "Buildroot version: " ${br_version}
 cd ${main_dir}
+
+function cleanup_mount {
+    mountpoint -q $1 && umount $1
+}
 
 function set_test_config {
     case "${arch_name}" in
@@ -259,15 +273,21 @@ function build_test {
 
 function launch_build {
     echo "  Setup chroot and launch build"
+    cleanup_mount ${chroot_dir}/proc
+    cleanup_mount ${build_dir}/buildroot
     rm -rf ${build_dir} || return 1
     mkdir -p ${build_dir} || return 1
     mkdir -p ${build_dir}/buildroot || return 1
 
-    if grep "bleeding-edge" <<<"${name}"; then
+
+    if [ ! -e ${chroot_dir}/.strapped ]; then
+        if grep "bleeding-edge" <<<"${name}"; then
+            debootstrap --variant=buildd stretch ${chroot_dir} http://ftp.us.debian.org/debian/ || return 1
+        else
             debootstrap --variant=buildd jessie ${chroot_dir} http://ftp.us.debian.org/debian/ || return 1
-    else
-            debootstrap --variant=buildd squeeze ${chroot_dir} http://archive.debian.org/debian/ || return 1
+        fi
     fi
+    touch ${chroot_dir}/.strapped
 
     mkdir -p ${chroot_dir}/proc || return 1
     mount --bind /proc ${chroot_dir}/proc || return 1
@@ -342,6 +362,44 @@ function make_br_fragment {
     echo "BEGIN FRAGMENT"
     cat ${fragment_file}
     echo "END FRAGMENT"
+}
+
+function upload_artifacts {
+
+    # Create directories on the server, where the different artifacts
+    # will be uploaded.
+    for d in fragments tarballs readmes summaries \
+                       build_test_logs boot_test_logs \
+                       build_fragments test_system_defconfigs \
+                       available_toolchains test-system; do
+        ssh ${ssh_server} "mkdir -p ${upload_folder}/${d}"
+    done
+
+    # Upload log of qemu defconfig build, as well as the qemu
+    # defconfig itself
+    if [ "${test_defconfig}" != "" ]; then
+        rsync ${testlogfile} ${ssh_server}:${upload_folder}/build_test_logs/
+        rsync ${test_dir}/defconfig ${ssh_server}:${upload_folder}/test_system_defconfigs/${release_name}.defconfig
+    fi
+    # Upload log of qemu boot
+    if [ "${test_qemu_cmd}" != "" ]; then
+        rsync ${bootlogfile} ${ssh_server}:${upload_folder}/boot_test_logs/${release_name}.log
+    fi
+
+    for i in ${test_dir}/images/* ; do
+	rsync $i ${ssh_server}:${upload_folder}/test-system/${release_name}-$(basename $i)
+    done
+
+    rsync ${readme_file} ${ssh_server}:${upload_folder}/readmes/${release_name}.txt                                 # README
+    rsync ${summary_file} ${ssh_server}:${upload_folder}/summaries/${release_name}.csv                              # summary
+    rsync "${release_name}.tar.bz2" ${ssh_server}:${upload_folder}/tarballs/                                        # toolchain tarball
+    rsync "${release_name}.sha256" ${ssh_server}:${upload_folder}/tarballs/                                         # toolchain checksum
+    rsync "${fragment_file}" ${ssh_server}:${upload_folder}/fragments/${release_name}.frag                          # BR fragment
+    rsync -r ${build_dir}/output/defconfig ${ssh_server}:${upload_folder}/build_fragments/${release_name}.defconfig # build fragment
+    rsync -r ${build_dir}/output/legal-info/host-licenses/ ${ssh_server}:${upload_root_folder}/${target}/licenses/  # licenses
+    rsync -r ${build_dir}/output/legal-info/host-sources/ ${ssh_server}:${upload_root_folder}/${target}/sources/    # sources
+    ssh ${ssh_server} "touch ${upload_folder}/available_toolchains/${release_name}"                                 # toolchain name for webpage listing
+    ssh ${ssh_server} "touch ${upload_root_folder}/NEED_REFRESH"
 }
 
 function package {
@@ -423,40 +481,7 @@ EOF
     tar cjf `basename ${release_name}`.tar.bz2 `basename ${toolchain_dir}`
     sha256sum ${release_name}.tar.bz2 > ${release_name}.sha256
 
-    # Create directories on the server, where the different artefacts
-    # will be uploaded.
-    for d in fragments tarballs readmes summaries \
-                       build_test_logs boot_test_logs \
-                       build_fragments test_system_defconfigs \
-                       available_toolchains test-system; do
-        ssh ${ssh_server} "mkdir -p ${upload_folder}/${d}"
-    done
-
-    # Upload log of qemu defconfig build, as well as the qemu
-    # defconfig itself
-    if [ "${test_defconfig}" != "" ]; then
-        rsync ${testlogfile} ${ssh_server}:${upload_folder}/build_test_logs/
-        rsync ${test_dir}/defconfig ${ssh_server}:${upload_folder}/test_system_defconfigs/${release_name}.defconfig
-    fi
-    # Upload log of qemu boot
-    if [ "${test_qemu_cmd}" != "" ]; then
-        rsync ${bootlogfile} ${ssh_server}:${upload_folder}/boot_test_logs/${release_name}.log
-    fi
-
-    for i in ${test_dir}/images/* ; do
-	rsync $i ${ssh_server}:${upload_folder}/test-system/${release_name}-$(basename $i)
-    done
-
-    rsync ${readme_file} ${ssh_server}:${upload_folder}/readmes/${release_name}.txt                                 # README
-    rsync ${summary_file} ${ssh_server}:${upload_folder}/summaries/${release_name}.csv                              # summary
-    rsync "${release_name}.tar.bz2" ${ssh_server}:${upload_folder}/tarballs/                                        # toolchain tarball
-    rsync "${release_name}.sha256" ${ssh_server}:${upload_folder}/tarballs/                                         # toolchain checksum
-    rsync "${fragment_file}" ${ssh_server}:${upload_folder}/fragments/${release_name}.frag                          # BR fragment
-    rsync -r ${build_dir}/output/defconfig ${ssh_server}:${upload_folder}/build_fragments/${release_name}.defconfig # build fragment
-    rsync -r ${build_dir}/output/legal-info/host-licenses/ ${ssh_server}:${upload_root_folder}/${target}/licenses/  # licenses
-    rsync -r ${build_dir}/output/legal-info/host-sources/ ${ssh_server}:${upload_root_folder}/${target}/sources/    # sources
-    ssh ${ssh_server} "touch ${upload_folder}/available_toolchains/${release_name}"                                 # toolchain name for webpage listing
-    ssh ${ssh_server} "touch ${upload_root_folder}/NEED_REFRESH"
+    [ "${build_type}" != "local" ] &&  upload_artifacts
 }
 
 function generate {
@@ -474,8 +499,9 @@ function generate {
     release_name=${name}-${version}
 
     echo "Uploading build log"
-    ssh ${ssh_server} "mkdir -p ${upload_folder}/build_logs"
-    scp ${logfile} ${ssh_server}:${upload_folder}/build_logs/${release_name}-build.log
+
+    [ "${build_type}" != "local" ] && ssh ${ssh_server} "mkdir -p ${upload_folder}/build_logs"
+    [ "${build_type}" != "local" ] && scp ${logfile} ${ssh_server}:${upload_folder}/build_logs/${release_name}-build.log
 
     if test $build_status -ne 0 ; then
         echo "Toolchain build failed, not going further"
